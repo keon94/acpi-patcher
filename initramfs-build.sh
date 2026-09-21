@@ -3,7 +3,7 @@
 KVER=$(uname -r)
 TEST_INITRD="$PWD/build/initramfs-$KVER-nvd1-test.img"
 
-sudo dracut -v \
+sudo dracut -v --force \
   --kver "$KVER" \
   --include "$PWD/build/nvd1-alias.aml" /kernel/firmware/acpi/nvd1-alias.aml \
   "$TEST_INITRD"
