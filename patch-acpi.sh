@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 set -eu
 
 # Install selected ACPI patches on a Fedora-like system.
@@ -15,7 +15,25 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 PYLIB_MAIN="$SCRIPT_DIR/pylib/main.py"
 
 die() {
+    # Print the user's custom error message first
     printf 'error: %s\n' "$*" >&2
+    echo "Stack trace (most recent call first):" >&2
+
+    # Loop through the bash call stack arrays
+    local i
+    for ((i=1; i<${#FUNCNAME[@]}; i++)); do
+        local func="${FUNCNAME[$i]}"
+        local line="${BASH_LINENO[$((i-1))]}"
+        local file="${BASH_SOURCE[$i]}"
+
+        # Format the top-level script scope for cleaner reading
+        if [ "$func" == "main" ] && [ $i -eq $(( ${#FUNCNAME[@]} - 1 )) ]; then
+            func="__main_scope__"
+        fi
+
+        printf '  at %s() in %s:%s\n' "$func" "$file" "$line" >&2
+    done
+
     exit 1
 }
 
@@ -158,7 +176,7 @@ resolve_patch_paths() {
         elif [ -f "$spec" ]; then
             case "$spec" in
                 *.dsl) printf '%s\n' "$spec" >>"$expanded" ;;
-                *) die "patch file does not have a .dsl suffix: $spec" ;;
+                *) die "dsl_patch file does not have a .dsl suffix: $spec" ;;
             esac
         else
             case "$spec" in
@@ -166,7 +184,7 @@ resolve_patch_paths() {
                     die "path pattern matched nothing: $spec"
                     ;;
                 *)
-                    die "patch path not found: $spec"
+                    die "dsl_patch path not found: $spec"
                     ;;
             esac
         fi
@@ -189,19 +207,17 @@ patch_mode() {
     esac
 }
 
-override_target() {
-    patch=$1
-    name=$(basename "$patch" .override.dsl)
+validate_original_dsl() {
+    dsl_patch=$1
+    name=$(basename "$dsl_patch" .override.dsl)
     manifest="$SCRIPT_DIR/acpi/.manifest"
     [ -r "$manifest" ] ||
-        die "override patch requires an ACPI manifest; run $SCRIPT_DIR/dump-acpi.sh first"
+        die "override dsl_patch requires an ACPI manifest; run $SCRIPT_DIR/dump-acpi.sh first"
 
-    target=$(awk -F '	' -v key="$name" '
-        $1 !~ /^#/ && $2 == key { print $2; found=1; exit }
-        END { if (!found) exit 1 }
-    ' "$manifest") ||
-        die "override patch stem does not match a table key in $manifest: $name"
-    printf '%s\n' "$target"
+    # Validates that $name matches an exact filename in the manifest
+    if ! grep -Eq "^[^#].*/${name}\.dsl$" "$manifest"; then
+        die "Component '$name' is missing or invalid in manifest."
+    fi
 }
 
 migrate_source_manifest() {
@@ -215,7 +231,7 @@ migrate_source_manifest() {
     }
 
     # Older versions tracked only generated AML names. Recover source paths
-    # when they still exist under the repository's patch directory.
+    # when they still exist under the repository's dsl_patch directory.
     if [ -r "$SYSTEM_MANIFEST" ]; then
         while IFS= read -r aml_name; do
             [ -n "$aml_name" ] || continue
@@ -263,7 +279,7 @@ build_desired_sources() {
         done <"$selected"
     fi
 
-    # A path is the identity of an installed patch. Last-write ordering is
+    # A path is the identity of an installed dsl_patch. Last-write ordering is
     # discarded here so rerunning the same command is idempotent.
     awk -F '	' '!seen[$2]++' "$desired" | LC_ALL=C sort -t '	' -k2,2 >"$desired.sorted"
     DESIRED_SOURCES="$desired.sorted"
@@ -314,47 +330,45 @@ compile_patches() {
     : >"$OVERRIDE_JOBS"
 
     if [ -s "$PATCH_LIST" ]; then
-        while IFS='	' read -r mode patch; do
-            [ -n "$patch" ] || continue
-            stem=$(basename "$patch" .dsl)
-            [ -n "$stem" ] || die "invalid empty patch name: $patch"
+        while IFS='	' read -r mode dsl_patch; do
+            [ -n "$dsl_patch" ] || continue
+            target_dsl_key=$(basename "$dsl_patch" .dsl)
+            [ -n "$target_dsl_key" ] || die "invalid empty dsl_patch name: $dsl_patch"
 
-            prefix="$COMPILE_STAGE/$stem"
-            printf 'Compiling %s\n' "$patch"
-            iasl -ve -tc -p "$prefix" "$patch"
-            [ -s "$prefix.aml" ] || die "iasl did not produce $stem.aml"
-
+            output_aml="$COMPILE_STAGE/$target_dsl_key.aml"
+            printf 'Compiling %s\n' "$dsl_patch"
+            iasl -ve -tc -p "$output_aml" "$dsl_patch"
+            [ -s "$output_aml" ] || die "iasl did not produce $output_aml"
             if [ "$mode" = override ]; then
-                target=$(override_target "$patch")
-                hook="${patch%.dsl}.py"
-                if [ -f "$hook" ]; then
+                validate_original_dsl "$dsl_patch"
+                python_patcher="${dsl_patch%.dsl}.py"
+                if [ -f "$python_patcher" ]; then
                     printf '%s\t%s\t%s\t%s\n' \
-                        "$target" "$patch" "$prefix.aml" "$hook" >>"$OVERRIDE_JOBS"
+                        "$target_dsl_key" "$dsl_patch" "$output_aml" "$python_patcher" >>"$OVERRIDE_JOBS"
                 else
                     printf '%s\t%s\t%s\t\n' \
-                        "$target" "$patch" "$prefix.aml" >>"$OVERRIDE_JOBS"
+                        "$target_dsl_key" "$dsl_patch" "$output_aml" >>"$OVERRIDE_JOBS"
                 fi
             else
-                hook="${patch%.dsl}.py"
-                if [ -f "$hook" ]; then
-                    run_pylib apply-dsl-patch \
-                        --hook "$hook" \
-                        --patch "$patch" \
-                        --aml "$prefix.aml" \
+                python_patcher="${dsl_patch%.dsl}.py"
+                if [ -f "$python_patcher" ]; then
+                    run_pylib apply-dsl-dsl_patch \
+                        --python_patcher "$python_patcher" \
+                        --dsl_patch "$dsl_patch" \
+                        --aml "$output_aml" \
                         --mode additive \
-                        --target "$stem" \
+                        --target "$target_dsl_key" \
                         --manifest "$SCRIPT_DIR/acpi/.manifest"
                 fi
-                aml_name="$stem.aml"
+                aml_name="$target_dsl_key.aml"
                 if grep -Fqx "$aml_name" "$AML_NAMES_FILE"; then
                     die "two additive patches produce the same AML name: $aml_name"
                 fi
-                install -m0644 "$prefix.aml" "$AML_STAGE/$aml_name"
+                install -m0644 "$output_aml" "$AML_STAGE/$aml_name"
                 printf '%s\n' "$aml_name" >>"$AML_NAMES_FILE"
             fi
         done <"$PATCH_LIST"
     fi
-
     if [ -s "$OVERRIDE_JOBS" ]; then
         manifest="$SCRIPT_DIR/acpi/.manifest"
         [ -r "$manifest" ] ||
@@ -388,7 +402,7 @@ compile_patches() {
     # Keep generated AMLs in the repository as reproducible build artifacts.
     mkdir -p "$AML_BUILD_DIR"
 
-    # Remove stale generated AMLs from a patch that was deleted or renamed.
+    # Remove stale generated AMLs from a dsl_patch that was deleted or renamed.
     for old_aml in "$AML_BUILD_DIR"/*.aml; do
         [ -f "$old_aml" ] || continue
         old_name=$(basename "$old_aml")
@@ -417,7 +431,7 @@ EOF
 
 install_aml_set() {
     # Remove AMLs managed by an earlier invocation but no longer produced by
-    # the current patch directory. This also migrates the old single-file
+    # the current dsl_patch directory. This also migrates the old single-file
     # acpi-fixes.aml layout used by the previous script.
     if [ -r "$SYSTEM_MANIFEST" ]; then
         while IFS= read -r old_name; do

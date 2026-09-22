@@ -1,5 +1,6 @@
 """Command-line adapter for ACPI table preparation and DSL patch hooks."""
-
+import sys
+import traceback
 from collections.abc import Callable
 from pathlib import Path
 
@@ -19,7 +20,8 @@ def _invoke(operation: Callable[[], None]) -> None:
         operation()
     except (AcpiError, OSError, ValueError) as error:
         typer.echo(f"error: {error}", err=True)
-        raise typer.Exit(code=1) from error
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(1)
 
 
 @app.command(name="prepare-overrides")

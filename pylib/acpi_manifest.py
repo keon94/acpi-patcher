@@ -36,7 +36,7 @@ class AcpiManifest:
             fields = line.split("\t")
             if len(fields) != 5:
                 raise AcpiError(
-                    f"manifest line {line_number} must have five tab-separated fields"
+                    f"manifest line {line_number} must have five tab-separated fields - had: {line!r}"
                 )
             order_text, key, kind_text, raw_text, dsl_text = fields
             try:

@@ -78,7 +78,7 @@ while IFS= read -r name; do
             cat "$log" >&2
             die "iasl failed while decompiling $name"
         fi
-        [ -s "$STAGE_DSL/$name.dsl" ] || die "iasl did not produce $name.dsl"
+        [ -s "$STAGE_DSL/$name.dsl" ] || die "iasl did not produce $STAGE_DSL/$name.dsl"
         printf '%04d\t%s\taml\traw/%s\tdsl/%s.dsl\n' \
             "$order" "$name" "$name" "$name" >>"$STAGE_MANIFEST"
     fi
