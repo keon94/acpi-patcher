@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-# Install the experimental NVD1 ACPI alias for every Fedora kernel.
+# Install the experimental ACPI patches for Fedora.
 #
 # Source patches:
 #   patches/*.dsl (processed in LC_ALL=C lexical order)
@@ -292,25 +292,38 @@ ensure_existing_entries() {
     fi
 }
 
-regenerate_initramfs_images() {
+regenerate_initramfs_kernel() {
+    kver=$1
+    vmlinuz="/boot/vmlinuz-$kver"
+    image="/boot/initramfs-$kver.img"
+
+    [ -e "$vmlinuz" ] || die "kernel image not found: $vmlinuz"
+    printf 'Building %s\n' "$image"
+    as_root dracut -v --force --kver "$kver" "$image"
+    as_root test -f "$image" || die "dracut did not create initramfs: $image"
+}
+
+regenerate_current_initramfs() {
+    kver=$(uname -r)
+    [ -d "/lib/modules/$kver" ] ||
+        die "running kernel modules not found: /lib/modules/$kver"
+    regenerate_initramfs_kernel "$kver"
+}
+
+regenerate_all_initramfs() {
     found_kernel=0
 
     for kernel_dir in /lib/modules/*; do
         [ -d "$kernel_dir" ] || continue
         kver=$(basename "$kernel_dir")
         vmlinuz="/boot/vmlinuz-$kver"
-        image="/boot/initramfs-$kver.img"
-
-        # Build the standard image explicitly, including if it was previously
-        # deleted. dracut --regenerate-all only discovers existing images.
         [ -e "$vmlinuz" ] || continue
         found_kernel=1
-        printf 'Building %s\n' "$image"
-        as_root dracut -v --force --kver "$kver" "$image"
-        as_root test -f "$image" || die "dracut did not create initramfs: $image"
+        regenerate_initramfs_kernel "$kver"
     done
 
-    [ "$found_kernel" -eq 1 ] || die "no installed kernels found under /boot and /lib/modules"
+    [ "$found_kernel" -eq 1 ] ||
+        die "no installed kernels found under /boot and /lib/modules"
 }
 
 verify_current_initramfs() {
@@ -342,7 +355,7 @@ remove_kernel_arg_from_cmdline() {
 }
 
 
-install_action() {
+prepare_install() {
     need_command dracut
 
     compile_patches
@@ -350,11 +363,25 @@ install_action() {
     install_aml_set
     ensure_kernel_cmdline
     ensure_existing_entries
+}
 
-    # The dracut config makes this persistent for future kernel upgrades;
-    # regenerate now so every currently installed kernel receives the table.
-    printf 'Regenerating installed initramfs images\n'
-    regenerate_initramfs_images
+finish_install() {
+    scope=$1
+
+    case "$scope" in
+        current)
+            printf 'Regenerating initramfs for the running kernel only\n'
+            regenerate_current_initramfs
+            ;;
+        all)
+            printf 'Regenerating initramfs for every installed kernel\n'
+            regenerate_all_initramfs
+            ;;
+        *)
+            die "unknown initramfs scope: $scope"
+            ;;
+    esac
+
     verify_current_initramfs
 
     printf 'ACPI fixes installed under: %s\n' "$SYSTEM_ACPI_DIR"
@@ -362,8 +389,17 @@ install_action() {
     printf 'Kernel argument: %s\n' "$KERNEL_ARG"
 }
 
+install_action() {
+    prepare_install
+    finish_install current
+}
 
-remove_action() {
+install_all_action() {
+    prepare_install
+    finish_install all
+}
+
+prepare_remove() {
     need_command dracut
 
     remove_aml_set
@@ -372,10 +408,37 @@ remove_action() {
     if command -v grubby >/dev/null 2>&1; then
         as_root grubby --update-kernel=ALL --remove-args="$KERNEL_ARG"
     fi
+}
 
-    printf 'Regenerating installed initramfs images\n'
-    regenerate_initramfs_images
-    printf 'ACPI fix removed. Existing old test entries/images were left untouched.\n'
+finish_remove() {
+    scope=$1
+
+    case "$scope" in
+        current)
+            printf 'Regenerating initramfs for the running kernel only\n'
+            regenerate_current_initramfs
+            printf 'ACPI fix removed from the running kernel image.\n'
+            printf 'Use %s remove-all to rebuild every installed kernel image.\n' "$0"
+            ;;
+        all)
+            printf 'Regenerating initramfs for every installed kernel\n'
+            regenerate_all_initramfs
+            printf 'ACPI fix removed from every installed kernel image.\n'
+            ;;
+        *)
+            die "unknown initramfs scope: $scope"
+            ;;
+    esac
+}
+
+remove_action() {
+    prepare_remove
+    finish_remove current
+}
+
+remove_all_action() {
+    prepare_remove
+    finish_remove all
 }
 
 status_action() {
@@ -441,12 +504,14 @@ status_action() {
 }
 
 usage() {
-    printf 'Usage: %s {install|status|remove}\n' "$0"
+    printf 'Usage: %s {install|install-all|status|remove|remove-all}\n' "$0"
 }
 
 case "$ACTION" in
     install) install_action ;;
+    install-all) install_all_action ;;
     status) status_action ;;
     remove) remove_action ;;
+    remove-all) remove_all_action ;;
     *) usage >&2; exit 2 ;;
 esac

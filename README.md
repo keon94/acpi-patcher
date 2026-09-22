@@ -3,7 +3,11 @@
 This repository provides a small, reversible workflow for experimenting with
 ACPI table additions and overrides on Linux.
 
-The tooling is generic, however assumes a Fedora-like layout and ecosystem. It is not inherently tied to any hardware, however at the time of creation it was for Lenovo and NVIDIA (on Fedora 44).
+The tooling is generic, but assumes a Fedora-like filesystem layout and
+ecosystem (`dracut`, BLS entries, and `grubby`). It is not inherently tied to
+any particular hardware. At the time of creation, it was being used to
+experiment with a Lenovo/NVIDIA system running Fedora 44. The current example
+patch, `patches/nvd1-alias.dsl`, is hardware-specific to that system.
 
 The contents of `acpi/` and `patches/` are intentionally ignored by Git.
 They are machine-specific inputs and must be created locally for each target
@@ -55,6 +59,13 @@ configuration makes them part of every future initramfs:
 
 The script also ensures the kernel argument `acpi_table_upgrade` is present in
 existing and future Fedora boot entries.
+
+Both scripts are safe to rerun. The ACPI installer removes stale AMLs it
+previously generated, normalizes the kernel argument to exactly one copy, and
+does not create duplicate boot entries. A normal `install` rebuilds only the
+running kernel's initramfs, limiting the blast radius of an experimental
+patch. Use `install-all` deliberately when every installed kernel should be
+rebuilt.
 
 ## Important distinction
 
@@ -120,12 +131,15 @@ patches/20-power-fix.dsl
 
 Every `.dsl` file must compile independently with `iasl`.
 
+The current Legion patch is only an example; do not copy it to another system
+without first inspecting that system's ACPI dump.
+
 ### 3. Compile and install the patch set
 
-Run the script as the normal user; it invokes `sudo` only for system changes:
+Run the script as root (normally through `sudo`):
 
 ```bash
-./acpi-fixes.sh install
+sudo ./acpi-fixes.sh install
 ```
 
 This will:
@@ -135,13 +149,22 @@ This will:
 3. Install the AML set and an ownership manifest.
 4. Configure dracut for ACPI table inclusion.
 5. Add `acpi_table_upgrade` to current and future boot entries.
-6. Regenerate all installed initramfs images.
+6. Regenerate only the running kernel's initramfs.
 7. Verify that the current initramfs contains every generated AML.
+
+To intentionally rebuild every installed kernel:
+
+```bash
+sudo ./acpi-fixes.sh install-all
+```
+
+The `install-all` action is opt-in because a malformed ACPI patch can prevent
+multiple boot entries from starting.
 
 Check the result:
 
 ```bash
-./acpi-fixes.sh status
+sudo ./acpi-fixes.sh status
 sudo journalctl -k -b --no-pager | grep -Ei 'ACPI|table upgrade|SSDT'
 ```
 
@@ -167,16 +190,50 @@ acpi_table_upgrade
 To remove the persistent ACPI patch set:
 
 ```bash
-./acpi-fixes.sh remove
+sudo ./acpi-fixes.sh remove
 ```
 
 This removes the managed AML files and dracut configuration, removes the
-kernel argument, regenerates initramfs images, and leaves unrelated files
-alone. Old experimental BLS entries and custom initramfs images are not deleted
+kernel argument, and rebuilds only the running kernel's initramfs. Use
+`remove-all` to rebuild every installed kernel after removal:
+
+```bash
+sudo ./acpi-fixes.sh remove-all
+```
+
+Old experimental BLS entries and custom initramfs images are not deleted
 automatically; remove those separately after the normal entry has been tested.
 
 ## Rollback on boot failure (IMPORTANT)
-If an ACPI patch produces an unbootable initramfs, select an older working Fedora kernel or rescue entry from the bootloader and boot it; then run sudo ./acpi-fixes.sh remove from the repository to remove the AMLs, dracut configuration, and acpi_table_upgrade, and regenerate the initramfs images. If no kernel boots, use Fedora’s live/rescue environment, mount the Fedora root and EFI filesystems, chroot into the installation, remove /etc/dracut.conf.d/90-acpi-fixes.conf and /etc/acpi-tables/.acpi-fixes-manifest plus the listed AML files, remove acpi_table_upgrade from /etc/kernel/cmdline, and run dracut --regenerate-all --force before rebooting.
+
+If an ACPI patch produces an unbootable initramfs, select an older working
+Fedora kernel or rescue entry from the bootloader and boot it. Then run:
+
+```bash
+cd <repo-directory>
+sudo ./acpi-fixes.sh remove-all
+```
+
+This removes the managed AMLs, dracut configuration, and
+`acpi_table_upgrade`, then rebuilds every installed initramfs without the
+patch.
+
+If no Fedora kernel boots, use a Fedora live/rescue environment. Mount the
+Fedora root and EFI filesystems, bind-mount `/dev`, `/proc`, `/sys`, and `/run`,
+then chroot into the installation. Inside the chroot:
+
+1. Remove `/etc/dracut.conf.d/90-acpi-fixes.conf`.
+2. Read `/etc/acpi-tables/.acpi-fixes-manifest` and remove only the listed AML
+   files from `/etc/acpi-tables/`, then remove the manifest.
+3. Remove `acpi_table_upgrade` from `/etc/kernel/cmdline`.
+4. Rebuild the initramfs images:
+
+   ```bash
+   dracut --regenerate-all --force
+   ```
+
+Reboot after exiting the chroot. Do not delete the entire
+`/etc/acpi-tables/` directory if it contains tables managed by something else.
 
 ## Repository layout
 
