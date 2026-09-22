@@ -1,18 +1,90 @@
 #!/bin/sh
 set -eu
 
-# Install the experimental ACPI patches for Fedora.
+# Install selected ACPI patches on a Fedora-like system.
 #
-# Source patches:
-#   patches/*.dsl (processed in LC_ALL=C lexical order)
+# Source patches are selected explicitly with --path. Files ending in
+# .override.dsl replace firmware tables; all other .dsl files are additive.
 #
 # Persistent installation:
-#   /etc/acpi-tables/*.aml (one per source DSL)
+#   /etc/acpi-tables/*.aml (managed additive and replacement tables)
 #   /etc/dracut.conf.d/90-acpi-fixes.conf
 #   /etc/kernel/cmdline (acpi_table_upgrade)
 
-ACTION=${1:-install}
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PYLIB_MAIN="$SCRIPT_DIR/pylib/main.py"
+
+die() {
+    printf 'error: %s\n' "$*" >&2
+    exit 1
+}
+
+run_pylib() {
+    (cd "$SCRIPT_DIR" && PYTHONDONTWRITEBYTECODE=1 python3 -m pylib.main "$@")
+}
+
+ACTION=
+ALL_KERNELS=0
+TMP_DIR=$(mktemp -d)
+PATH_SPECS_FILE="$TMP_DIR/path-specs"
+
+usage() {
+    printf 'Usage:\n'
+    printf '  %s install [--all-kernels] --path PATH [PATH ...]\n' "$0"
+    printf '  %s remove|uninstall [--all-kernels] --path PATH [PATH ...]\n' "$0"
+    printf '  %s status\n' "$0"
+}
+
+parse_args() {
+    [ "$#" -gt 0 ] || { usage >&2; exit 2; }
+
+    ACTION=$1
+    shift
+
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --all-kernels)
+                ALL_KERNELS=1
+                shift
+                ;;
+            --path)
+                shift
+                [ "$#" -gt 0 ] || die '--path requires at least one path'
+                while [ "$#" -gt 0 ]; do
+                    case "$1" in
+                        --*) break ;;
+                    esac
+                    printf '%s\n' "$1" >>"$PATH_SPECS_FILE"
+                    shift
+                done
+                ;;
+            --help|-h)
+                usage
+                exit 0
+                ;;
+            *)
+                die "unknown option or argument: $1"
+                ;;
+        esac
+    done
+
+    case "$ACTION" in
+        install|remove|uninstall)
+            [ -s "$PATH_SPECS_FILE" ] ||
+                die "$ACTION requires --path PATH [PATH ...]"
+            ;;
+        status)
+            [ "$ALL_KERNELS" -eq 0 ] || die 'status does not accept --all-kernels'
+            [ ! -s "$PATH_SPECS_FILE" ] || die 'status does not accept --path'
+            ;;
+        *)
+            usage >&2
+            exit 2
+            ;;
+    esac
+}
+
+parse_args "$@"
 
 if [ "$(id -u)" -ne 0 ]; then
     printf 'error: this script must run as root; use: sudo %s %s\n' "$0" "$ACTION" >&2
@@ -32,16 +104,10 @@ fi
 
 SYSTEM_ACPI_DIR=/etc/acpi-tables
 SYSTEM_MANIFEST="$SYSTEM_ACPI_DIR/.acpi-fixes-manifest"
+SOURCE_MANIFEST="$SYSTEM_ACPI_DIR/.acpi-fixes-sources"
 DRACUT_CONF=/etc/dracut.conf.d/90-acpi-fixes.conf
 KERNEL_CMDLINE=/etc/kernel/cmdline
 KERNEL_ARG=acpi_table_upgrade
-
-TMP_DIR=
-
-die() {
-    printf 'error: %s\n' "$*" >&2
-    exit 1
-}
 
 as_root() {
     if [ "$(id -u)" -eq 0 ]; then
@@ -63,6 +129,144 @@ restore_build_ownership() {
 
 need_command() {
     command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
+}
+
+canonical_path() {
+    path=$1
+    case "$path" in
+        /*) absolute=$path ;;
+        *) absolute="$PWD/$path" ;;
+    esac
+
+    directory=$(dirname -- "$absolute")
+    filename=$(basename -- "$absolute")
+    (
+        CDPATH= cd -P "$directory" 2>/dev/null || exit 1
+        printf '%s/%s\n' "$PWD" "$filename"
+    ) || die "cannot resolve path: $path"
+}
+
+resolve_patch_paths() {
+    resolved="$TMP_DIR/selected-patches"
+    expanded="$TMP_DIR/expanded-paths"
+    : >"$expanded"
+
+    while IFS= read -r spec; do
+        [ -n "$spec" ] || continue
+        if [ -d "$spec" ]; then
+            find "$spec" -maxdepth 1 -type f -name '*.dsl' -print >>"$expanded"
+        elif [ -f "$spec" ]; then
+            case "$spec" in
+                *.dsl) printf '%s\n' "$spec" >>"$expanded" ;;
+                *) die "patch file does not have a .dsl suffix: $spec" ;;
+            esac
+        else
+            case "$spec" in
+                *\**|*\?*|*\[*\]*)
+                    die "path pattern matched nothing: $spec"
+                    ;;
+                *)
+                    die "patch path not found: $spec"
+                    ;;
+            esac
+        fi
+    done <"$PATH_SPECS_FILE"
+
+    [ -s "$expanded" ] || die 'the selected paths contain no .dsl files'
+
+    while IFS= read -r path; do
+        canonical_path "$path"
+    done <"$expanded" | LC_ALL=C sort -u >"$resolved"
+
+    [ -s "$resolved" ] || die 'the selected paths contain no .dsl files'
+    SELECTED_PATCHES=$resolved
+}
+
+patch_mode() {
+    case "$1" in
+        *.override.dsl) printf 'override\n' ;;
+        *) printf 'additive\n' ;;
+    esac
+}
+
+override_target() {
+    patch=$1
+    name=$(basename "$patch" .override.dsl)
+    manifest="$SCRIPT_DIR/acpi/.manifest"
+    [ -r "$manifest" ] ||
+        die "override patch requires an ACPI manifest; run $SCRIPT_DIR/dump-acpi.sh first"
+
+    target=$(awk -F '	' -v key="$name" '
+        $1 !~ /^#/ && $2 == key { print $2; found=1; exit }
+        END { if (!found) exit 1 }
+    ' "$manifest") ||
+        die "override patch stem does not match a table key in $manifest: $name"
+    printf '%s\n' "$target"
+}
+
+migrate_source_manifest() {
+    migrated="$TMP_DIR/migrated-sources"
+    : >"$migrated"
+
+    [ -r "$SOURCE_MANIFEST" ] && {
+        cat "$SOURCE_MANIFEST" >"$migrated"
+        printf '%s\n' "$migrated"
+        return 0
+    }
+
+    # Older versions tracked only generated AML names. Recover source paths
+    # when they still exist under the repository's patch directory.
+    if [ -r "$SYSTEM_MANIFEST" ]; then
+        while IFS= read -r aml_name; do
+            [ -n "$aml_name" ] || continue
+            stem=$(basename "$aml_name" .aml)
+            candidate="$PATCH_DIR/$stem.dsl"
+            if [ -f "$candidate" ]; then
+                printf '%s\t%s\n' "$(patch_mode "$candidate")" "$(canonical_path "$candidate")" >>"$migrated"
+            fi
+        done <"$SYSTEM_MANIFEST"
+    fi
+
+    printf '%s\n' "$migrated"
+}
+
+build_desired_sources() {
+    action=$1
+    current=$(migrate_source_manifest)
+    desired="$TMP_DIR/desired-sources"
+    selected="$TMP_DIR/selected-canonical"
+    : >"$desired"
+    : >"$selected"
+
+    while IFS= read -r path; do
+        printf '%s\n' "$path" >>"$selected"
+    done <"$SELECTED_PATCHES"
+
+    if [ -r "$current" ]; then
+        while IFS='	' read -r mode path; do
+            [ -n "$path" ] || continue
+            keep=1
+            while IFS= read -r selected_path; do
+                [ "$path" = "$selected_path" ] && keep=0
+            done <"$selected"
+
+            if [ "$action" = install ] || [ "$keep" -eq 1 ]; then
+                printf '%s\t%s\n' "$mode" "$path" >>"$desired"
+            fi
+        done <"$current"
+    fi
+
+    if [ "$action" = install ]; then
+        while IFS= read -r path; do
+            [ -n "$path" ] || continue
+            printf '%s\t%s\n' "$(patch_mode "$path")" "$path" >>"$desired"
+        done <"$selected"
+    fi
+
+    # A path is the identity of an installed patch. Last-write ordering is
+    # discarded here so rerunning the same command is idempotent.
+    awk -F '	' '!seen[$2]++' "$desired" | LC_ALL=C sort -t '	' -k2,2 >"$desired.sorted"
+    DESIRED_SOURCES="$desired.sorted"
 }
 
 cleanup() {
@@ -87,32 +291,99 @@ write_root_file_if_changed() {
 
 compile_patches() {
     need_command iasl
-    [ -d "$PATCH_DIR" ] || die "patch directory not found: $PATCH_DIR"
+    need_command python3
+    [ -r "$PYLIB_MAIN" ] ||
+        die "Python ACPI helper not found: $PYLIB_MAIN"
 
-    TMP_DIR=$(mktemp -d)
-    PATCH_LIST="$TMP_DIR/patch-list"
+    resolve_patch_paths
+    case "$ACTION" in
+        install) build_desired_sources install ;;
+        remove|uninstall) build_desired_sources remove ;;
+        *) die "cannot build patches for action: $ACTION" ;;
+    esac
+
+    PATCH_LIST="$DESIRED_SOURCES"
     AML_STAGE="$TMP_DIR/aml"
     COMPILE_STAGE="$TMP_DIR/compile"
     AML_NAMES_FILE="$TMP_DIR/aml-names"
+    OVERRIDE_JOBS="$TMP_DIR/override-jobs"
+    OVERRIDE_MANIFEST="$TMP_DIR/override-manifest"
 
     mkdir -p "$AML_STAGE" "$COMPILE_STAGE"
-    find "$PATCH_DIR" -maxdepth 1 -type f -name '*.dsl' -print |
-        LC_ALL=C sort >"$PATCH_LIST"
-    [ -s "$PATCH_LIST" ] || die "no .dsl patches found in $PATCH_DIR"
-
     : >"$AML_NAMES_FILE"
-    while IFS= read -r patch; do
-        stem=$(basename "$patch" .dsl)
-        [ -n "$stem" ] || die "invalid empty patch name: $patch"
+    : >"$OVERRIDE_JOBS"
 
-        prefix="$COMPILE_STAGE/$stem"
-        printf 'Compiling %s\n' "$patch"
-        iasl -ve -tc -p "$prefix" "$patch"
-        [ -s "$prefix.aml" ] || die "iasl did not produce $stem.aml"
+    if [ -s "$PATCH_LIST" ]; then
+        while IFS='	' read -r mode patch; do
+            [ -n "$patch" ] || continue
+            stem=$(basename "$patch" .dsl)
+            [ -n "$stem" ] || die "invalid empty patch name: $patch"
 
-        install -m0644 "$prefix.aml" "$AML_STAGE/$stem.aml"
-        printf '%s\n' "$stem.aml" >>"$AML_NAMES_FILE"
-    done <"$PATCH_LIST"
+            prefix="$COMPILE_STAGE/$stem"
+            printf 'Compiling %s\n' "$patch"
+            iasl -ve -tc -p "$prefix" "$patch"
+            [ -s "$prefix.aml" ] || die "iasl did not produce $stem.aml"
+
+            if [ "$mode" = override ]; then
+                target=$(override_target "$patch")
+                hook="${patch%.dsl}.py"
+                if [ -f "$hook" ]; then
+                    printf '%s\t%s\t%s\t%s\n' \
+                        "$target" "$patch" "$prefix.aml" "$hook" >>"$OVERRIDE_JOBS"
+                else
+                    printf '%s\t%s\t%s\t\n' \
+                        "$target" "$patch" "$prefix.aml" >>"$OVERRIDE_JOBS"
+                fi
+            else
+                hook="${patch%.dsl}.py"
+                if [ -f "$hook" ]; then
+                    run_pylib apply-dsl-patch \
+                        --hook "$hook" \
+                        --patch "$patch" \
+                        --aml "$prefix.aml" \
+                        --mode additive \
+                        --target "$stem" \
+                        --manifest "$SCRIPT_DIR/acpi/.manifest"
+                fi
+                aml_name="$stem.aml"
+                if grep -Fqx "$aml_name" "$AML_NAMES_FILE"; then
+                    die "two additive patches produce the same AML name: $aml_name"
+                fi
+                install -m0644 "$prefix.aml" "$AML_STAGE/$aml_name"
+                printf '%s\n' "$aml_name" >>"$AML_NAMES_FILE"
+            fi
+        done <"$PATCH_LIST"
+    fi
+
+    if [ -s "$OVERRIDE_JOBS" ]; then
+        manifest="$SCRIPT_DIR/acpi/.manifest"
+        [ -r "$manifest" ] ||
+            die "override patches require an ACPI manifest; run $SCRIPT_DIR/dump-acpi.sh first"
+
+        override_stage="$TMP_DIR/override"
+        override_manifest="$AML_BUILD_DIR/acpi-overrides.manifest"
+        mkdir -p "$override_stage" "$AML_BUILD_DIR"
+        rm -f "$AML_BUILD_DIR/acpi-overrides.cpio" \
+            "$AML_BUILD_DIR/acpi-ordered.cpio" \
+            "$AML_BUILD_DIR/acpi-ordered.manifest"
+
+        run_pylib prepare-overrides \
+            --manifest "$manifest" \
+            --output-dir "$override_stage" \
+            --output-manifest "$override_manifest" \
+            --job-file "$OVERRIDE_JOBS"
+
+        while IFS='	' read -r target filename source; do
+            [ -n "$filename" ] || continue
+            installed_name="override-$filename"
+            install -m0644 "$override_stage/$filename" "$AML_STAGE/$installed_name"
+            printf '%s\n' "$installed_name" >>"$AML_NAMES_FILE"
+        done <"$override_manifest"
+    else
+        rm -f "$AML_BUILD_DIR/acpi-overrides.cpio" "$AML_BUILD_DIR/acpi-overrides.manifest"
+        # Remove artifacts produced by an older framework version.
+        rm -f "$AML_BUILD_DIR/acpi-ordered.cpio" "$AML_BUILD_DIR/acpi-ordered.manifest"
+    fi
 
     # Keep generated AMLs in the repository as reproducible build artifacts.
     mkdir -p "$AML_BUILD_DIR"
@@ -172,6 +443,15 @@ install_aml_set() {
     done <"$AML_NAMES_FILE"
 
     write_root_file_if_changed "$AML_NAMES_FILE" "$SYSTEM_MANIFEST" 0644
+    write_root_file_if_changed "$DESIRED_SOURCES" "$SOURCE_MANIFEST" 0644
+}
+
+remove_dracut_config_and_argument() {
+    as_root rm -f "$DRACUT_CONF" "$SOURCE_MANIFEST" "$SYSTEM_MANIFEST"
+    remove_kernel_arg_from_cmdline
+    if command -v grubby >/dev/null 2>&1; then
+        as_root grubby --update-kernel=ALL --remove-args="$KERNEL_ARG"
+    fi
 }
 
 remove_aml_set() {
@@ -250,8 +530,7 @@ ensure_kernel_cmdline() {
         # /etc/kernel/cmdline yet. Seed it from a normal, non-experimental entry.
         base_entry=$(find /boot/loader/entries -maxdepth 1 -type f -name '*.conf' \
             ! -name '*~custom.conf' \
-            ! -name '*nvd1*' \
-            ! -name '*acpi*' \
+            ! -name '*custom*.conf' \
             -print 2>/dev/null | sort | head -n 1)
 
         [ -n "$base_entry" ] || die "cannot derive /etc/kernel/cmdline; create it manually"
@@ -359,10 +638,15 @@ prepare_install() {
     need_command dracut
 
     compile_patches
-    install_dracut_config
     install_aml_set
-    ensure_kernel_cmdline
-    ensure_existing_entries
+
+    if [ -s "$AML_NAMES_FILE" ]; then
+        install_dracut_config
+        ensure_kernel_cmdline
+        ensure_existing_entries
+    else
+        remove_dracut_config_and_argument
+    fi
 }
 
 finish_install() {
@@ -391,22 +675,10 @@ finish_install() {
 
 install_action() {
     prepare_install
-    finish_install current
-}
-
-install_all_action() {
-    prepare_install
-    finish_install all
-}
-
-prepare_remove() {
-    need_command dracut
-
-    remove_aml_set
-    remove_kernel_arg_from_cmdline
-
-    if command -v grubby >/dev/null 2>&1; then
-        as_root grubby --update-kernel=ALL --remove-args="$KERNEL_ARG"
+    if [ "$ALL_KERNELS" -eq 1 ]; then
+        finish_install all
+    else
+        finish_install current
     fi
 }
 
@@ -417,8 +689,8 @@ finish_remove() {
         current)
             printf 'Regenerating initramfs for the running kernel only\n'
             regenerate_current_initramfs
-            printf 'ACPI fix removed from the running kernel image.\n'
-            printf 'Use %s remove-all to rebuild every installed kernel image.\n' "$0"
+            printf 'Selected ACPI patches removed from the running kernel image.\n'
+            printf 'Use %s remove --all-kernels --path ... to rebuild every installed kernel image.\n' "$0"
             ;;
         all)
             printf 'Regenerating initramfs for every installed kernel\n'
@@ -432,13 +704,12 @@ finish_remove() {
 }
 
 remove_action() {
-    prepare_remove
-    finish_remove current
-}
-
-remove_all_action() {
-    prepare_remove
-    finish_remove all
+    prepare_install
+    if [ "$ALL_KERNELS" -eq 1 ]; then
+        finish_remove all
+    else
+        finish_remove current
+    fi
 }
 
 status_action() {
@@ -448,6 +719,16 @@ status_action() {
     printf 'Dracut config:    %s\n' "$DRACUT_CONF"
     printf 'Kernel cmdline:   %s\n' "$KERNEL_CMDLINE"
     printf '\n'
+
+    if [ -r "$SOURCE_MANIFEST" ]; then
+        printf 'installed patches:\n'
+        while IFS='	' read -r mode path; do
+            [ -n "$path" ] || continue
+            printf '  [%s] %s\n' "$mode" "$path"
+        done <"$SOURCE_MANIFEST"
+    else
+        printf 'installed patches: no source manifest\n'
+    fi
 
     if [ -r "$SYSTEM_MANIFEST" ]; then
         printf 'installed AMLs:\n'
@@ -503,15 +784,9 @@ status_action() {
     fi
 }
 
-usage() {
-    printf 'Usage: %s {install|install-all|status|remove|remove-all}\n' "$0"
-}
-
 case "$ACTION" in
     install) install_action ;;
-    install-all) install_all_action ;;
     status) status_action ;;
-    remove) remove_action ;;
-    remove-all) remove_all_action ;;
+    remove|uninstall) remove_action ;;
     *) usage >&2; exit 2 ;;
 esac
