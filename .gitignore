@@ -1,0 +1,10 @@
+build/
+tmp/
+logs/
+
+acpi/**/*
+!acpi/.keep
+
+patches/**/*
+!patches/.keep
+
