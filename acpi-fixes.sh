@@ -14,9 +14,21 @@ set -eu
 ACTION=${1:-install}
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
+if [ "$(id -u)" -ne 0 ]; then
+    printf 'error: this script must run as root; use: sudo %s %s\n' "$0" "$ACTION" >&2
+    exit 1
+fi
+
 PATCH_DIR=${PATCH_DIR:-"$SCRIPT_DIR/patches"}
 BUILD_DIR=${BUILD_DIR:-"$SCRIPT_DIR/build"}
 AML_BUILD_DIR="$BUILD_DIR/acpi-fixes"
+
+# When invoked through sudo, keep generated repository artifacts owned by the
+# invoking user rather than leaving build/ root-owned.
+REPO_OWNER=
+if [ -n "${SUDO_UID:-}" ] && [ -n "${SUDO_GID:-}" ]; then
+    REPO_OWNER="$SUDO_UID:$SUDO_GID"
+fi
 
 SYSTEM_ACPI_DIR=/etc/acpi-tables
 SYSTEM_MANIFEST="$SYSTEM_ACPI_DIR/.acpi-fixes-manifest"
@@ -37,6 +49,16 @@ as_root() {
     else
         sudo "$@"
     fi
+}
+
+restore_build_ownership() {
+    [ -n "$REPO_OWNER" ] || return 0
+
+    case "$BUILD_DIR" in
+        "$SCRIPT_DIR"/*)
+            chown -R "$REPO_OWNER" "$BUILD_DIR"
+            ;;
+    esac
 }
 
 need_command() {
@@ -94,9 +116,21 @@ compile_patches() {
 
     # Keep generated AMLs in the repository as reproducible build artifacts.
     mkdir -p "$AML_BUILD_DIR"
+
+    # Remove stale generated AMLs from a patch that was deleted or renamed.
+    for old_aml in "$AML_BUILD_DIR"/*.aml; do
+        [ -f "$old_aml" ] || continue
+        old_name=$(basename "$old_aml")
+        if ! grep -Fxq "$old_name" "$AML_NAMES_FILE"; then
+            rm -f "$old_aml"
+        fi
+    done
+
     while IFS= read -r aml_name; do
         install -Dm0644 "$AML_STAGE/$aml_name" "$AML_BUILD_DIR/$aml_name"
     done <"$AML_NAMES_FILE"
+
+    restore_build_ownership
 }
 
 install_dracut_config() {
@@ -140,6 +174,22 @@ install_aml_set() {
     write_root_file_if_changed "$AML_NAMES_FILE" "$SYSTEM_MANIFEST" 0644
 }
 
+remove_aml_set() {
+    if [ -r "$SYSTEM_MANIFEST" ]; then
+        while IFS= read -r aml_name; do
+            [ -n "$aml_name" ] || continue
+            case "$aml_name" in
+                */*|.|..) die "unsafe AML name in $SYSTEM_MANIFEST: $aml_name" ;;
+            esac
+            as_root rm -f "$SYSTEM_ACPI_DIR/$aml_name"
+        done <"$SYSTEM_MANIFEST"
+    else
+        # Migration fallback for the former single-file installation.
+        as_root rm -f "$SYSTEM_ACPI_DIR/acpi-fixes.aml"
+    fi
+    as_root rm -f "$SYSTEM_MANIFEST" "$DRACUT_CONF"
+}
+
 entry_has_kernel_arg() {
     entry=$1
     options=$(awk '
@@ -150,29 +200,38 @@ entry_has_kernel_arg() {
         }
     ' "$entry")
 
-    has_kernel_arg_text "$options"
+    [ "$(kernel_arg_count "$options")" -eq 1 ]
 }
 
-has_kernel_arg_text() {
+kernel_arg_count() {
     text=$1
     printf '%s\n' "$text" | awk -v arg="$KERNEL_ARG" '
         {
             for (i = 1; i <= NF; i++) {
-                if ($i == arg) found = 1
+                if ($i == arg) count++
             }
         }
-        END { exit(found ? 0 : 1) }
+        END { print count + 0 }
+    '
+}
+
+strip_kernel_arg() {
+    text=$1
+    printf '%s\n' "$text" | awk -v arg="$KERNEL_ARG" '
+        {
+            output = ""
+            for (i = 1; i <= NF; i++) {
+                if ($i == arg) continue
+                if (output != "") output = output " "
+                output = output $i
+            }
+            print output
+        }
     '
 }
 
 append_kernel_arg() {
-    value=$1
-
-    if has_kernel_arg_text "$value"; then
-        printf '%s\n' "$value"
-        return 0
-    fi
-
+    value=$(strip_kernel_arg "$1")
     value=$(printf '%s' "$value" | sed 's/[[:space:]]*$//')
     if [ -n "$value" ]; then
         printf '%s %s\n' "$value" "$KERNEL_ARG"
@@ -226,14 +285,40 @@ ensure_existing_entries() {
 
     if [ "$need_update" -eq 1 ]; then
         need_command grubby
+        # Normalize rather than blindly appending: this removes duplicates
+        # left by older versions or manual edits, then adds exactly one copy.
+        as_root grubby --update-kernel=ALL --remove-args="$KERNEL_ARG"
         as_root grubby --update-kernel=ALL --args="$KERNEL_ARG"
     fi
+}
+
+regenerate_initramfs_images() {
+    found_kernel=0
+
+    for kernel_dir in /lib/modules/*; do
+        [ -d "$kernel_dir" ] || continue
+        kver=$(basename "$kernel_dir")
+        vmlinuz="/boot/vmlinuz-$kver"
+        image="/boot/initramfs-$kver.img"
+
+        # Build the standard image explicitly, including if it was previously
+        # deleted. dracut --regenerate-all only discovers existing images.
+        [ -e "$vmlinuz" ] || continue
+        found_kernel=1
+        printf 'Building %s\n' "$image"
+        as_root dracut -v --force --kver "$kver" "$image"
+        as_root test -f "$image" || die "dracut did not create initramfs: $image"
+    done
+
+    [ "$found_kernel" -eq 1 ] || die "no installed kernels found under /boot and /lib/modules"
 }
 
 verify_current_initramfs() {
     need_command lsinitrd
     image="/boot/initramfs-$(uname -r).img"
-    [ -r "$image" ] || die "current initramfs not found: $image"
+    # Initramfs images are normally mode 0600 and root-owned.  Test for
+    # existence here; lsinitrd is run through as_root below.
+    as_root test -f "$image" || die "current initramfs not found: $image"
 
     listing="$TMP_DIR/current-initrd.list"
     as_root lsinitrd "$image" >"$listing"
@@ -243,6 +328,19 @@ verify_current_initramfs() {
         fi
     done <"$AML_NAMES_FILE"
 }
+
+remove_kernel_arg_from_cmdline() {
+    [ -r "$KERNEL_CMDLINE" ] || return 0
+
+    if [ -z "$TMP_DIR" ]; then
+        TMP_DIR=$(mktemp -d)
+    fi
+
+    cmdline_tmp="$TMP_DIR/kernel.cmdline.remove"
+    strip_kernel_arg "$(cat "$KERNEL_CMDLINE")" >"$cmdline_tmp"
+    write_root_file_if_changed "$cmdline_tmp" "$KERNEL_CMDLINE" 0644
+}
+
 
 install_action() {
     need_command dracut
@@ -256,7 +354,7 @@ install_action() {
     # The dracut config makes this persistent for future kernel upgrades;
     # regenerate now so every currently installed kernel receives the table.
     printf 'Regenerating installed initramfs images\n'
-    as_root dracut -v --regenerate-all --force
+    regenerate_initramfs_images
     verify_current_initramfs
 
     printf 'ACPI fixes installed under: %s\n' "$SYSTEM_ACPI_DIR"
@@ -264,36 +362,11 @@ install_action() {
     printf 'Kernel argument: %s\n' "$KERNEL_ARG"
 }
 
-remove_kernel_arg_from_cmdline() {
-    [ -r "$KERNEL_CMDLINE" ] || return 0
-
-    if [ -z "$TMP_DIR" ]; then
-        TMP_DIR=$(mktemp -d)
-    fi
-
-    cmdline_tmp="$TMP_DIR/kernel.cmdline.remove"
-    sed -E \
-        "s/(^|[[:space:]])${KERNEL_ARG}([[:space:]]|$)/ /g; s/[[:space:]]+/ /g; s/^ //; s/ $//" \
-        "$KERNEL_CMDLINE" >"$cmdline_tmp"
-    write_root_file_if_changed "$cmdline_tmp" "$KERNEL_CMDLINE" 0644
-}
 
 remove_action() {
     need_command dracut
 
-    if [ -r "$SYSTEM_MANIFEST" ]; then
-        while IFS= read -r aml_name; do
-            [ -n "$aml_name" ] || continue
-            case "$aml_name" in
-                */*|.|..) die "unsafe AML name in $SYSTEM_MANIFEST: $aml_name" ;;
-            esac
-            as_root rm -f "$SYSTEM_ACPI_DIR/$aml_name"
-        done <"$SYSTEM_MANIFEST"
-    else
-        # Migration fallback for the former single-file installation.
-        as_root rm -f "$SYSTEM_ACPI_DIR/acpi-fixes.aml"
-    fi
-    as_root rm -f "$SYSTEM_MANIFEST" "$DRACUT_CONF"
+    remove_aml_set
     remove_kernel_arg_from_cmdline
 
     if command -v grubby >/dev/null 2>&1; then
@@ -301,7 +374,7 @@ remove_action() {
     fi
 
     printf 'Regenerating installed initramfs images\n'
-    as_root dracut --regenerate-all --force
+    regenerate_initramfs_images
     printf 'ACPI fix removed. Existing old test entries/images were left untouched.\n'
 }
 
@@ -344,7 +417,8 @@ status_action() {
     printf 'running cmdline: '
     cat /proc/cmdline
     printf 'current initramfs: '
-    if [ -r "/boot/initramfs-$(uname -r).img" ] && command -v lsinitrd >/dev/null 2>&1; then
+    if as_root test -f "/boot/initramfs-$(uname -r).img" &&
+        command -v lsinitrd >/dev/null 2>&1; then
         listing=$(mktemp)
         as_root lsinitrd "/boot/initramfs-$(uname -r).img" >"$listing"
         if [ -r "$SYSTEM_MANIFEST" ]; then
