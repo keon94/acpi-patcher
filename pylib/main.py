@@ -1,7 +1,9 @@
-"""Command-line adapter for ACPI table preparation and DSL patch hooks."""
+"""Command-line adapter for ACPI table preparation."""
+
+import os
 import sys
 import traceback
-from collections.abc import Callable
+
 from pathlib import Path
 
 import typer
@@ -9,66 +11,54 @@ import typer
 from .acpi_manifest import AcpiManifest
 from .acpi_overrider import AcpiTableOverrider
 from .errors import AcpiError
-from .patch import AcpiPatch, DslPatch, PatchContext, PatchMode
 
 
-app = typer.Typer(help=__doc__, no_args_is_help=True)
+class ErrorHandlingTyper(typer.Typer):
+    def __call__(self, *args, **kwargs):
+        try:
+            # Run the Typer application normally
+            super().__call__(*args, **kwargs)
+        except (AcpiError, OSError, ValueError) as e:
+            typer.echo(f"error: {e}", err=True, color=True)
+            _, _, tb = sys.exc_info()
+            sys.stderr.writelines(self.__cleanup_stacktrace__(traceback.extract_tb(tb)))
+            sys.exit(1)
+
+    @staticmethod
+    def __cleanup_stacktrace__(frames):
+        current_file = os.path.abspath(__file__)
+        start_index = 0
+        for i, frame in enumerate(reversed(frames)):
+            if os.path.abspath(frame.filename) == current_file:
+                start_index = len(frames) - i - 1
+                break
+
+        # 4. Filter frames and print the clean stack trace
+        filtered_frames = frames[start_index:]
+        return traceback.format_list(filtered_frames)
 
 
-def _invoke(operation: Callable[[], None]) -> None:
-    try:
-        operation()
-    except (AcpiError, OSError, ValueError) as error:
-        typer.echo(f"error: {error}", err=True)
-        traceback.print_exc(file=sys.stderr)
-        sys.exit(1)
+app = ErrorHandlingTyper(help=__doc__, no_args_is_help=True)
 
 
-@app.command(name="prepare-overrides")
+@app.callback()
+def main() -> None:
+    pass
+
+
+@app.command(name="prepare-dsl-overrides")
 def prepare_acpi_table_overrides(
     manifest: Path = typer.Option(..., "--manifest"),
     output_dir: Path = typer.Option(..., "--output-dir"),
     output_manifest: Path = typer.Option(..., "--output-manifest"),
     replacement: list[str] = typer.Option([], "--replacement", metavar="TABLE_KEY=AML"),
     replacement_file: Path | None = typer.Option(None, "--replacement-file"),
-    job_file: Path | None = typer.Option(None, "--job-file"),
 ) -> None:
-    def prepare() -> None:
-        overrides = AcpiTableOverrider(AcpiManifest.read(manifest), output_dir)
-        overrides.add_specs(replacement)
-        if replacement_file is not None:
-            overrides.add_file(replacement_file)
-        if job_file is not None:
-            for patch in DslPatch.read_jobs(job_file, overrides.manifest):
-                overrides.add_patch(patch)
-        overrides.prepare().write_manifest(output_manifest)
-
-    _invoke(prepare)
-
-
-@app.command(name="apply-dsl-patch")
-def apply_dsl_patch_command(
-    hook: Path = typer.Option(..., "--hook"),
-    patch: Path = typer.Option(..., "--patch"),
-    aml: Path = typer.Option(..., "--aml"),
-    mode: PatchMode = typer.Option(PatchMode.ADDITIVE, "--mode"),
-    target: str = typer.Option("", "--target"),
-    manifest: Path | None = typer.Option(None, "--manifest"),
-) -> None:
-    def apply() -> None:
-        acpi_manifest = (
-            AcpiManifest.read(manifest)
-            if manifest is not None and manifest.is_file()
-            else None
-        )
-        context = PatchContext(patch, aml, mode, target, acpi_manifest)
-        AcpiPatch.load(hook).apply(context)
-        if context.replacements:
-            raise AcpiError(
-                "additive DSL patches may mutate compiled AML but may not replace tables"
-            )
-
-    _invoke(apply)
+    overrides = AcpiTableOverrider(AcpiManifest.read(manifest), output_dir)
+    overrides.add_specs(replacement)
+    if replacement_file is not None:
+        overrides.add_file(replacement_file)
+    overrides.prepare().write_manifest(output_manifest)
 
 
 if __name__ == "__main__":

@@ -4,17 +4,12 @@ from .acpi_header import AcpiHeader
 from .acpi_manifest import AcpiManifest
 from .acpi_overrider import AcpiTableOverrider, PreparedAcpiTables
 from .acpi_table import AcpiTable, TableKind
-from .patch import AcpiPatch, DslPatch, PatchContext, PatchMode
 
 __all__ = [
     "AcpiHeader",
     "AcpiManifest",
-    "AcpiPatch",
     "AcpiTable",
     "AcpiTableOverrider",
-    "DslPatch",
-    "PatchContext",
-    "PatchMode",
     "PreparedAcpiTables",
     "TableKind",
 ]

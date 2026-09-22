@@ -94,13 +94,6 @@ if [ -r "$MANIFEST" ]; then
     while IFS='	' read -r old_order old_key old_kind old_raw old_dsl; do
         case "$old_raw" in
             raw/*) rm -f "$ACPI_DIR/$old_raw" ;;
-            "") ;;
-            *)
-                # Compatibility with the original one-column manifest.
-                case "$old_order" in
-                    raw/*|dsl/*) rm -f "$ACPI_DIR/$old_order" ;;
-                esac
-                ;;
         esac
         case "$old_dsl" in
             dsl/*) rm -f "$ACPI_DIR/$old_dsl" ;;

@@ -10,7 +10,7 @@ from .errors import AcpiError
 
 
 MANIFEST_VERSION = "acpi-patcher-manifest-v1"
-SAFE_NAME = re.compile(r"^[A-Za-z0-9._+-]+$")
+SAFE_NAME = re.compile(r"^[A-Za-z0-9.!_+-]+$")
 
 
 @dataclass(frozen=True, slots=True)

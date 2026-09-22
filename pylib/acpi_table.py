@@ -20,16 +20,12 @@ class AcpiTable:
     raw_path: Path
     dsl_path: Path | None
 
-    def prepare_override(self, replacement_path: Path | None = None) -> bytes:
+    def prepare_override(self, replacement_path: Path) -> bytes:
         raw_data = self.raw_path.read_bytes()
         raw_header = AcpiHeader.parse(raw_data, self.raw_path)
-        if replacement_path is None:
-            source_data = raw_data
-            source_header = raw_header
-        else:
-            source_data = replacement_path.read_bytes()
-            source_header = AcpiHeader.parse(source_data, replacement_path)
-            raw_header.validate_replacement(source_header, replacement_path, self.key)
+        source_data = replacement_path.read_bytes()
+        source_header = AcpiHeader.parse(source_data, replacement_path)
+        raw_header.validate_replacement(source_header, replacement_path, self.key)
         return source_header.upgraded(source_data, raw_header.oem_revision + 1)
 
 

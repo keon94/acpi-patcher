@@ -111,7 +111,6 @@ fi
 
 PATCH_DIR=${PATCH_DIR:-"$SCRIPT_DIR/patches"}
 BUILD_DIR=${BUILD_DIR:-"$SCRIPT_DIR/build"}
-AML_BUILD_DIR="$BUILD_DIR/acpi-fixes"
 
 # When invoked through sudo, keep generated repository artifacts owned by the
 # invoking user rather than leaving build/ root-owned.
@@ -220,35 +219,8 @@ validate_original_dsl() {
     fi
 }
 
-migrate_source_manifest() {
-    migrated="$TMP_DIR/migrated-sources"
-    : >"$migrated"
-
-    [ -r "$SOURCE_MANIFEST" ] && {
-        cat "$SOURCE_MANIFEST" >"$migrated"
-        printf '%s\n' "$migrated"
-        return 0
-    }
-
-    # Older versions tracked only generated AML names. Recover source paths
-    # when they still exist under the repository's dsl_patch directory.
-    if [ -r "$SYSTEM_MANIFEST" ]; then
-        while IFS= read -r aml_name; do
-            [ -n "$aml_name" ] || continue
-            stem=$(basename "$aml_name" .aml)
-            candidate="$PATCH_DIR/$stem.dsl"
-            if [ -f "$candidate" ]; then
-                printf '%s\t%s\n' "$(patch_mode "$candidate")" "$(canonical_path "$candidate")" >>"$migrated"
-            fi
-        done <"$SYSTEM_MANIFEST"
-    fi
-
-    printf '%s\n' "$migrated"
-}
-
 build_desired_sources() {
     action=$1
-    current=$(migrate_source_manifest)
     desired="$TMP_DIR/desired-sources"
     selected="$TMP_DIR/selected-canonical"
     : >"$desired"
@@ -258,7 +230,7 @@ build_desired_sources() {
         printf '%s\n' "$path" >>"$selected"
     done <"$SELECTED_PATCHES"
 
-    if [ -r "$current" ]; then
+    if [ -r "$SOURCE_MANIFEST" ]; then
         while IFS='	' read -r mode path; do
             [ -n "$path" ] || continue
             keep=1
@@ -269,7 +241,7 @@ build_desired_sources() {
             if [ "$action" = install ] || [ "$keep" -eq 1 ]; then
                 printf '%s\t%s\n' "$mode" "$path" >>"$desired"
             fi
-        done <"$current"
+        done <"$SOURCE_MANIFEST"
     fi
 
     if [ "$action" = install ]; then
@@ -322,12 +294,11 @@ compile_patches() {
     AML_STAGE="$TMP_DIR/aml"
     COMPILE_STAGE="$TMP_DIR/compile"
     AML_NAMES_FILE="$TMP_DIR/aml-names"
-    OVERRIDE_JOBS="$TMP_DIR/override-jobs"
     OVERRIDE_MANIFEST="$TMP_DIR/override-manifest"
+    override_args=()
 
     mkdir -p "$AML_STAGE" "$COMPILE_STAGE"
     : >"$AML_NAMES_FILE"
-    : >"$OVERRIDE_JOBS"
 
     if [ -s "$PATCH_LIST" ]; then
         while IFS='	' read -r mode dsl_patch; do
@@ -341,25 +312,9 @@ compile_patches() {
             [ -s "$output_aml" ] || die "iasl did not produce $output_aml"
             if [ "$mode" = override ]; then
                 validate_original_dsl "$dsl_patch"
-                python_patcher="${dsl_patch%.dsl}.py"
-                if [ -f "$python_patcher" ]; then
-                    printf '%s\t%s\t%s\t%s\n' \
-                        "$target_dsl_key" "$dsl_patch" "$output_aml" "$python_patcher" >>"$OVERRIDE_JOBS"
-                else
-                    printf '%s\t%s\t%s\t\n' \
-                        "$target_dsl_key" "$dsl_patch" "$output_aml" >>"$OVERRIDE_JOBS"
-                fi
+                target_dsl_key=$(basename "$target_dsl_key" .override)
+                override_args+=(--replacement "$target_dsl_key=$output_aml")
             else
-                python_patcher="${dsl_patch%.dsl}.py"
-                if [ -f "$python_patcher" ]; then
-                    run_pylib apply-dsl-dsl_patch \
-                        --python_patcher "$python_patcher" \
-                        --dsl_patch "$dsl_patch" \
-                        --aml "$output_aml" \
-                        --mode additive \
-                        --target "$target_dsl_key" \
-                        --manifest "$SCRIPT_DIR/acpi/.manifest"
-                fi
                 aml_name="$target_dsl_key.aml"
                 if grep -Fqx "$aml_name" "$AML_NAMES_FILE"; then
                     die "two additive patches produce the same AML name: $aml_name"
@@ -369,23 +324,20 @@ compile_patches() {
             fi
         done <"$PATCH_LIST"
     fi
-    if [ -s "$OVERRIDE_JOBS" ]; then
+    if [ "${#override_args[@]}" -gt 0 ]; then
         manifest="$SCRIPT_DIR/acpi/.manifest"
         [ -r "$manifest" ] ||
             die "override patches require an ACPI manifest; run $SCRIPT_DIR/dump-acpi.sh first"
 
         override_stage="$TMP_DIR/override"
-        override_manifest="$AML_BUILD_DIR/acpi-overrides.manifest"
-        mkdir -p "$override_stage" "$AML_BUILD_DIR"
-        rm -f "$AML_BUILD_DIR/acpi-overrides.cpio" \
-            "$AML_BUILD_DIR/acpi-ordered.cpio" \
-            "$AML_BUILD_DIR/acpi-ordered.manifest"
+        override_manifest="$BUILD_DIR/acpi-overrides.manifest"
+        mkdir -p "$override_stage" "$BUILD_DIR"
 
-        run_pylib prepare-overrides \
+        run_pylib prepare-dsl-overrides \
             --manifest "$manifest" \
             --output-dir "$override_stage" \
             --output-manifest "$override_manifest" \
-            --job-file "$OVERRIDE_JOBS"
+            "${override_args[@]}"
 
         while IFS='	' read -r target filename source; do
             [ -n "$filename" ] || continue
@@ -394,16 +346,14 @@ compile_patches() {
             printf '%s\n' "$installed_name" >>"$AML_NAMES_FILE"
         done <"$override_manifest"
     else
-        rm -f "$AML_BUILD_DIR/acpi-overrides.cpio" "$AML_BUILD_DIR/acpi-overrides.manifest"
-        # Remove artifacts produced by an older framework version.
-        rm -f "$AML_BUILD_DIR/acpi-ordered.cpio" "$AML_BUILD_DIR/acpi-ordered.manifest"
+        rm -f "$BUILD_DIR/acpi-overrides.manifest"
     fi
 
     # Keep generated AMLs in the repository as reproducible build artifacts.
-    mkdir -p "$AML_BUILD_DIR"
+    mkdir -p "$BUILD_DIR"
 
     # Remove stale generated AMLs from a dsl_patch that was deleted or renamed.
-    for old_aml in "$AML_BUILD_DIR"/*.aml; do
+    for old_aml in "$BUILD_DIR"/*.aml; do
         [ -f "$old_aml" ] || continue
         old_name=$(basename "$old_aml")
         if ! grep -Fxq "$old_name" "$AML_NAMES_FILE"; then
@@ -412,7 +362,7 @@ compile_patches() {
     done
 
     while IFS= read -r aml_name; do
-        install -Dm0644 "$AML_STAGE/$aml_name" "$AML_BUILD_DIR/$aml_name"
+        install -Dm0644 "$AML_STAGE/$aml_name" "$BUILD_DIR/$aml_name"
     done <"$AML_NAMES_FILE"
 
     restore_build_ownership
@@ -431,8 +381,7 @@ EOF
 
 install_aml_set() {
     # Remove AMLs managed by an earlier invocation but no longer produced by
-    # the current dsl_patch directory. This also migrates the old single-file
-    # acpi-fixes.aml layout used by the previous script.
+    # the current patch set.
     if [ -r "$SYSTEM_MANIFEST" ]; then
         while IFS= read -r old_name; do
             [ -n "$old_name" ] || continue
@@ -443,9 +392,6 @@ install_aml_set() {
                 as_root rm -f "$SYSTEM_ACPI_DIR/$old_name"
             fi
         done <"$SYSTEM_MANIFEST"
-    elif [ -f "$SYSTEM_ACPI_DIR/acpi-fixes.aml" ] &&
-        ! grep -Fxq 'acpi-fixes.aml' "$AML_NAMES_FILE"; then
-        as_root rm -f "$SYSTEM_ACPI_DIR/acpi-fixes.aml"
     fi
 
     as_root install -d -m0755 "$SYSTEM_ACPI_DIR"
@@ -477,9 +423,6 @@ remove_aml_set() {
             esac
             as_root rm -f "$SYSTEM_ACPI_DIR/$aml_name"
         done <"$SYSTEM_MANIFEST"
-    else
-        # Migration fallback for the former single-file installation.
-        as_root rm -f "$SYSTEM_ACPI_DIR/acpi-fixes.aml"
     fi
     as_root rm -f "$SYSTEM_MANIFEST" "$DRACUT_CONF"
 }
@@ -578,8 +521,7 @@ ensure_existing_entries() {
 
     if [ "$need_update" -eq 1 ]; then
         need_command grubby
-        # Normalize rather than blindly appending: this removes duplicates
-        # left by older versions or manual edits, then adds exactly one copy.
+        # Normalize rather than blindly appending so exactly one copy remains.
         as_root grubby --update-kernel=ALL --remove-args="$KERNEL_ARG"
         as_root grubby --update-kernel=ALL --args="$KERNEL_ARG"
     fi
@@ -619,20 +561,50 @@ regenerate_all_initramfs() {
         die "no installed kernels found under /boot and /lib/modules"
 }
 
-verify_current_initramfs() {
+verify_initramfs_kernel() {
+    kver=$1
     need_command lsinitrd
-    image="/boot/initramfs-$(uname -r).img"
+    image="/boot/initramfs-$kver.img"
     # Initramfs images are normally mode 0600 and root-owned.  Test for
     # existence here; lsinitrd is run through as_root below.
-    as_root test -f "$image" || die "current initramfs not found: $image"
+    as_root test -f "$image" || die "initramfs not found: $image"
 
-    listing="$TMP_DIR/current-initrd.list"
+    listing="$TMP_DIR/initrd-$kver.list"
     as_root lsinitrd "$image" >"$listing"
     while IFS= read -r aml_name; do
+        [ -n "$aml_name" ] || continue
         if ! grep -Fq "kernel/firmware/acpi/$aml_name" "$listing"; then
             die "ACPI AML was not found in $image: $aml_name"
         fi
     done <"$AML_NAMES_FILE"
+
+    while IFS= read -r aml_name; do
+        [ -n "$aml_name" ] || continue
+        if ! grep -Fxq "$aml_name" "$AML_NAMES_FILE" &&
+            grep -Fq "kernel/firmware/acpi/$aml_name" "$listing"; then
+            die "removed ACPI AML is still present in $image: $aml_name"
+        fi
+    done <"$PREVIOUS_AML_NAMES_FILE"
+}
+
+verify_initramfs_scope() {
+    scope=$1
+    case "$scope" in
+        current)
+            verify_initramfs_kernel "$(uname -r)"
+            ;;
+        all)
+            for kernel_dir in /lib/modules/*; do
+                [ -d "$kernel_dir" ] || continue
+                kver=$(basename "$kernel_dir")
+                [ -e "/boot/vmlinuz-$kver" ] || continue
+                verify_initramfs_kernel "$kver"
+            done
+            ;;
+        *)
+            die "unknown initramfs verification scope: $scope"
+            ;;
+    esac
 }
 
 remove_kernel_arg_from_cmdline() {
@@ -650,6 +622,13 @@ remove_kernel_arg_from_cmdline() {
 
 prepare_install() {
     need_command dracut
+
+    PREVIOUS_AML_NAMES_FILE="$TMP_DIR/previous-aml-names"
+    if [ -r "$SYSTEM_MANIFEST" ]; then
+        cat "$SYSTEM_MANIFEST" >"$PREVIOUS_AML_NAMES_FILE"
+    else
+        : >"$PREVIOUS_AML_NAMES_FILE"
+    fi
 
     compile_patches
     install_aml_set
@@ -680,7 +659,7 @@ finish_install() {
             ;;
     esac
 
-    verify_current_initramfs
+    verify_initramfs_scope "$scope"
 
     printf 'ACPI fixes installed under: %s\n' "$SYSTEM_ACPI_DIR"
     printf 'Dracut config: %s\n' "$DRACUT_CONF"
@@ -715,6 +694,8 @@ finish_remove() {
             die "unknown initramfs scope: $scope"
             ;;
     esac
+
+    verify_initramfs_scope "$scope"
 }
 
 remove_action() {
@@ -728,7 +709,7 @@ remove_action() {
 
 status_action() {
     printf 'Patch directory:  %s\n' "$PATCH_DIR"
-    printf 'Generated AMLs:   %s\n' "$AML_BUILD_DIR"
+    printf 'Generated AMLs:   %s\n' "$BUILD_DIR"
     printf 'Installed AMLs:   %s\n' "$SYSTEM_ACPI_DIR"
     printf 'Dracut config:    %s\n' "$DRACUT_CONF"
     printf 'Kernel cmdline:   %s\n' "$KERNEL_CMDLINE"

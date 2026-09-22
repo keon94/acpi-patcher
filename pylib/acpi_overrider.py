@@ -7,7 +7,6 @@ from pathlib import Path
 from .acpi_manifest import AcpiManifest
 from .acpi_table import AcpiTable, PreparedAcpiTable, TableKind
 from .errors import AcpiError
-from .patch import AcpiPatch, DslPatch, PatchContext, PatchMode
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,39 +60,23 @@ class AcpiTableOverrider:
                 )
             self.add(fields[0], Path(fields[1]))
 
-    def add_patch(self, patch: DslPatch) -> None:
-        if patch.target in self.replacements:
-            raise AcpiError(f"more than one replacement targets {patch.target}")
-        context = PatchContext(
-            patch.source_path,
-            patch.compiled_aml,
-            PatchMode.OVERRIDE,
-            patch.target,
-            self.manifest,
-        )
-        if patch.hook_path is not None:
-            AcpiPatch.load(patch.hook_path).apply(context)
-        context.replacements.setdefault(patch.target, patch.compiled_aml)
-        for target, aml_path in context.replacements.items():
-            self.add(target, aml_path)
-
     def prepare(self) -> PreparedAcpiTables:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         for stale in self.output_dir.glob("*.aml"):
             stale.unlink()
 
         prepared = tuple(
-            self._prepare(table)
+            self._prepare(table, self.replacements[table.key])
             for table in self.manifest.tables
-            if table.kind is TableKind.AML
+            if table.key in self.replacements
         )
         if not prepared:
             raise AcpiError("the ACPI manifest contains no AML tables to stage")
         return PreparedAcpiTables(self.output_dir, prepared)
 
-    def _prepare(self, table: AcpiTable) -> PreparedAcpiTable:
+    def _prepare(self, table: AcpiTable, replacement_path: Path) -> PreparedAcpiTable:
         filename = f"{table.order:04d}-{table.key}.aml"
         (self.output_dir / filename).write_bytes(
-            table.prepare_override(self.replacements.get(table.key))
+            table.prepare_override(replacement_path)
         )
         return PreparedAcpiTable(table.key, filename, table.raw_path)

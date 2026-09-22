@@ -37,7 +37,7 @@ images:
 An ordinary .dsl file is an additive AML table. Its compiled output is loaded
 in addition to the firmware tables:
 
-    patches/10-add-method.dsl  ->  build/acpi-fixes/10-add-method.aml
+    patches/10-add-method.dsl  ->  build/10-add-method.aml
 
 A file whose name ends in .override.dsl replaces one table from the ACPI dump.
 The portion before .override.dsl must exactly match a key in acpi/.manifest:
@@ -45,59 +45,20 @@ The portion before .override.dsl must exactly match a key in acpi/.manifest:
     patches/SSDT7.override.dsl
 
 The installer does not infer table order from patch names. The dump manifest
-contains the table key, raw file, table kind, and load order; the generic
-Python helper uses that metadata when assembling the replacement set.
-
-## Optional Python hooks
-
-For either patch type, an optional Python file may sit next to the DSL with
-the same complete basename:
-
-    patches/10-add-method.dsl
-    patches/10-add-method.py
-
-    patches/SSDT7.override.dsl
-    patches/SSDT7.override.py
-
-The hook must define a concrete `Patch` class:
-
-    from pylib.patch import AcpiPatch, PatchContext
-
-    class Patch(AcpiPatch):
-        def apply(self, context: PatchContext) -> None:
-            ...
-
-The hook receives a PatchContext with:
-
-| Attribute or method | Purpose |
-| --- | --- |
-| context.patch_path | selected DSL path |
-| context.compiled_aml | compiled AML path; additive hooks may edit it in place |
-| context.mode | additive or override |
-| context.target | replacement table key, or patch stem for an additive hook |
-| context.manifest | typed AcpiManifest when available |
-| context.manifest.tables | ordered typed AcpiTable values |
-| context.replace_table(key, aml_path) | redirect an override to another compiled AML |
-| context.log(message) | print a diagnostic message |
-
-For an override, the overrider uses the compiled AML for the target after the
-hook runs unless the hook registered a different file. A hook only calls
-context.replace_table() to redirect that replacement or add another table.
-Additive hooks may edit their AML in place, but may not register table
-replacements.
-
-Hooks execute as root during installation. Treat them as trusted local code.
+contains the table key, raw file, table kind, and load order; the Python helper
+uses that metadata to validate and stage only the tables explicitly replaced
+by selected patches. Unmodified firmware tables are never copied into the
+initramfs.
 
 The Python boundary is deliberately small. patch-acpi.sh remains responsible for
 path selection, DSL compilation, installed-file manifests, dracut, kernel
 arguments, initramfs regeneration, and rollback. The typed Python package is
-used only for replacement-table mechanics and hook execution:
+used only for replacement-table mechanics:
 
 * acpi_header.py parses and updates ACPI table headers;
 * acpi_table.py defines captured and prepared ACPI tables;
 * acpi_manifest.py reads and queries captured table manifests;
 * acpi_overrider.py prepares complete ACPI table override sets;
-* patch.py defines DSL patches, hook context, and hook application;
 * main.py provides the narrow shell-facing command line.
 
 ## Requirements
@@ -182,6 +143,10 @@ To remove the persistent patch set:
 
 The first command removes the selected source patches from the managed
 installation; the second rebuilds all installed kernel images without them.
+Removal verifies that every previously managed AML is absent from each rebuilt
+image in the selected kernel scope. The regenerated images are functionally
+restored to the current system configuration without these ACPI fixes; they are
+not byte-for-byte copies of the images that existed before installation.
 Unrelated files and boot entries are left alone. Old custom initramfs images
 or experimental BLS entries created outside this script must be removed
 separately after the normal entry has been tested.
@@ -197,22 +162,19 @@ filesystems, chroot into the installation, remove
     dracut --regenerate-all --force
 
 ## Repository layout
-
     .
     ├── patch-acpi.sh
-    ├── pylib/
-    │   ├── acpi_header.py
-    │   ├── acpi_manifest.py
-    │   ├── acpi_table.py
-    │   ├── acpi_overrider.py
-    │   ├── patch.py
-    │   └── main.py
     ├── dump-acpi.sh
+    ├── pylib/
+    │   ├── *.py (contains python helpers used by the shell script)
     ├── acpi/
-    │   ├── raw/
-    │   └── dsl/
+    │   ├── raw/*
+    │   ├── dsl/*.dsl
+    │   └── .manifest
     ├── build/
-    │   └── acpi-fixes/
+    │   ├── acpi-overrides.manifest (for replacement ACPI patches)
+    │   ├── override-*.aml (for replacement ACPI patches)
+    │   └── *.aml (for additive ACPI patches)
     └── patches/
-        ├── *.dsl
-        └── *.py
+        ├── *.override.dsl (for replacement ACPI patches)
+        └── *.dsl (for additive ACPI patches)
